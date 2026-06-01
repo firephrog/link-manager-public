@@ -89,6 +89,32 @@ function findTextRanges(content, search) {
   return ranges;
 }
 
+const TUNNEL_URL_RE = /https:\/\/[\w-]+\.trycloudflare\.com/g;
+
+function findExistingTunnelUrls(content) {
+  const found = [];
+  const walk = (elements) => {
+    for (const el of elements || []) {
+      if (el.paragraph) {
+        for (const pe of el.paragraph.elements || []) {
+          if (pe.textRun && pe.textRun.content) {
+            const matches = pe.textRun.content.match(TUNNEL_URL_RE);
+            if (matches) for (const m of matches) found.push(m);
+          }
+        }
+      } else if (el.table) {
+        for (const row of el.table.tableRows || []) {
+          for (const cell of row.tableCells || []) {
+            walk(cell.content);
+          }
+        }
+      }
+    }
+  };
+  walk(content);
+  return found;
+}
+
 async function updateDoc(page, segments) {
   const docId = extractDocId(page.googledoc);
   if (!docId) return;
@@ -98,7 +124,28 @@ async function updateDoc(page, segments) {
   const prev = state[docId] || {};
   const next = buildValues(page, segments);
 
+  // Fetch current doc so we can detect drift (URLs already substituted in)
+  // and replace them positionally instead of relying solely on the state file.
+  const beforeDoc = await docs.documents.get({ documentId: docId });
+  const existingTunnelUrls = findExistingTunnelUrls(beforeDoc.data.body.content);
+  // Dedupe in insertion order so duplicate URLs (same URL pasted twice) only map once.
+  const dedupedExisting = [...new Set(existingTunnelUrls)];
+
   const requests = [];
+
+  // Positional drift correction: i-th tunnel URL in doc → i-th slot URL.
+  for (let i = 0; i < Math.min(dedupedExisting.length, SLOTS); i++) {
+    const slotUrl = next[`<LINK_${i + 1}>`];
+    if (slotUrl && slotUrl.startsWith('http') && slotUrl !== dedupedExisting[i]) {
+      requests.push({
+        replaceAllText: {
+          containsText: { text: dedupedExisting[i], matchCase: true },
+          replaceText: slotUrl,
+        },
+      });
+    }
+  }
+
   for (const placeholder of Object.keys(next)) {
     const newValue = next[placeholder];
     const prevValue = prev[placeholder];
@@ -113,7 +160,7 @@ async function updateDoc(page, segments) {
       });
     }
     // Replace whatever value we previously substituted in.
-    if (prevValue && prevValue !== placeholder && prevValue !== newValue) {
+    if (prevValue && prevValue !== placeholder && prevValue !== newValue && !dedupedExisting.includes(prevValue)) {
       requests.push({
         replaceAllText: {
           containsText: { text: prevValue, matchCase: true },
@@ -123,12 +170,17 @@ async function updateDoc(page, segments) {
     }
   }
 
+  let totalChanged = 0;
   if (requests.length > 0) {
-    await docs.documents.batchUpdate({
+    const resp = await docs.documents.batchUpdate({
       documentId: docId,
       requestBody: { requests },
     });
+    for (const r of resp.data.replies || []) {
+      totalChanged += r.replaceAllText?.occurrencesChanged || 0;
+    }
   }
+  console.log(`[googledoc:${docId}] ${requests.length} replace requests, ${totalChanged} occurrences changed (existing tunnel URLs in doc: ${dedupedExisting.length})`);
 
   // Style pass: mark each link URL as a clickable hyperlink with white text.
   const doc = await docs.documents.get({ documentId: docId });
